@@ -15,7 +15,7 @@ import httpx
 from anthropic import APITimeoutError, AsyncAnthropic
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.error import TimedOut
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 logger = logging.getLogger(__name__)
@@ -197,9 +197,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 chat_id=update.effective_chat.id,
                 text=user_text,
             )
-        except TimedOut as e:
+        except (TimedOut, NetworkError) as e:
             logger.warning(
-                "링크 전송 후 응답 타임아웃(채팅에는 이미 표시됐을 수 있음): %s",
+                "링크 전송 후 텔레그램 네트워크/타임아웃(이미 전달됐을 수 있음): %s",
                 e,
             )
         except Exception as e:
@@ -229,9 +229,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             chat_id=update.effective_chat.id,
             text=translated,
         )
-    except TimedOut as e:
+    except (TimedOut, NetworkError) as e:
         logger.warning(
-            "번역 전송 후 응답 타임아웃(채팅에는 이미 표시됐을 수 있음): %s",
+            "번역 전송 후 텔레그램 네트워크/타임아웃(채팅에는 이미 표시됐을 수 있음): %s",
             e,
         )
     except Exception as e:
@@ -240,6 +240,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             chat_id=update.effective_chat.id,
             text=f"번역은 되었지만 전송에 실패했습니다: {error_text}",
         )
+
+
+async def _telegram_error_handler(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """폴링·핸들러에서 터진 예외를 잡아 프로세스가 죽지 않게 함."""
+    err = context.error
+    if err is None:
+        return
+    if isinstance(err, NetworkError):
+        logger.warning(
+            "Telegram NetworkError (연결 일시 끊김·재시도 가능): %s",
+            err,
+            exc_info=err,
+        )
+        return
+    logger.error("텔레그램 봇 처리 중 예외", exc_info=err)
 
 
 def main() -> None:
@@ -251,20 +268,21 @@ def main() -> None:
         raise ValueError(
             "TELEGRAM_TOKEN과 ANTHROPIC_API_KEY를 .env 파일에 설정해 주세요."
         )
-    # 기본 read_timeout=5초는 느린망/긴 답장에서 sendMessage가 Timed out 날 수 있음
+    # PythonAnywhere ↔ api.telegram.org 구간이 불안정할 때 ReadError·NetworkError 완화
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(60.0)
-        .write_timeout(60.0)
-        .pool_timeout(30.0)
-        .get_updates_connect_timeout(30.0)
-        .get_updates_read_timeout(60.0)
-        .get_updates_write_timeout(60.0)
-        .get_updates_pool_timeout(30.0)
+        .connect_timeout(45.0)
+        .read_timeout(120.0)
+        .write_timeout(120.0)
+        .pool_timeout(60.0)
+        .get_updates_connect_timeout(45.0)
+        .get_updates_read_timeout(120.0)
+        .get_updates_write_timeout(120.0)
+        .get_updates_pool_timeout(60.0)
         .build()
     )
+    app.add_error_handler(_telegram_error_handler)
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Caption) & ~filters.COMMAND,
