@@ -15,7 +15,7 @@ import httpx
 from anthropic import APITimeoutError, AsyncAnthropic
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.error import NetworkError, TimedOut
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 logger = logging.getLogger(__name__)
@@ -254,6 +254,13 @@ async def _telegram_error_handler(
     err = context.error
     if err is None:
         return
+    if isinstance(err, Conflict):
+        logger.error(
+            "Conflict: 다른 곳에서 같은 봇으로 getUpdates(폴링) 중입니다. "
+            "Bash·다른 서버·예전 프로세스를 모두 끄거나, 웹훅을 쓰던 적이 있으면 "
+            "이번 main.py는 시작 시 delete_webhook을 호출합니다. 토큰이 유출됐다면 BotFather에서 Revoke.",
+        )
+        return
     if isinstance(err, NetworkError):
         logger.warning(
             "Telegram NetworkError (연결 일시 끊김·재시도 가능): %s",
@@ -264,11 +271,19 @@ async def _telegram_error_handler(
     logger.error("텔레그램 봇 처리 중 예외", exc_info=err)
 
 
+async def _post_init(application: Application) -> None:
+    """웹훅이 남아 있으면 폴링과 충돌(409 Conflict)하므로 제거."""
+    await application.bot.delete_webhook(drop_pending_updates=False)
+    logger.info("delete_webhook 완료(폴링 전용)")
+
+
 def main() -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         level=logging.INFO,
     )
+    # httpx INFO는 요청 URL에 봇 토큰이 포함되어 로그에 노출됨
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     if not TELEGRAM_TOKEN or not ANTHROPIC_API_KEY:
         raise ValueError(
             "TELEGRAM_TOKEN과 ANTHROPIC_API_KEY를 .env 파일에 설정해 주세요."
@@ -277,6 +292,7 @@ def main() -> None:
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
+        .post_init(_post_init)
         .connect_timeout(45.0)
         .read_timeout(120.0)
         .write_timeout(120.0)
