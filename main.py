@@ -280,6 +280,37 @@ async def _post_init(application: Application) -> None:
     logger.info("delete_webhook 완료(폴링 전용)")
 
 
+def _verify_telegram_token(token: str) -> None:
+    """폴링 전 getMe로 토큰 검사 — InvalidToken 시 로그에 한국어 안내가 먼저 보이게 함."""
+    try:
+        r = httpx.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            timeout=20.0,
+        )
+    except httpx.RequestError as e:
+        raise RuntimeError(
+            "Telegram 서버에 연결하지 못했습니다. 네트워크를 확인해 주세요."
+        ) from e
+    if r.status_code == 401:
+        raise ValueError(
+            "TELEGRAM_TOKEN이 거절되었습니다(Unauthorized). "
+            "BotFather에서 해당 봇 → API Token → 문자를 다시 복사해 "
+            ".env에 TELEGRAM_TOKEN=한줄로만 넣으세요(따옴표·앞뒤 공백 없음). "
+            "Revoke 후에는 새로 받은 토큰만 유효합니다."
+        )
+    if r.status_code != 200:
+        raise ValueError(f"getMe HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    if not data.get("ok"):
+        raise ValueError(f"getMe 응답 실패: {data}")
+    res = data.get("result") or {}
+    logger.info(
+        "Telegram 연결 확인됨: @%s (%s)",
+        res.get("username", "?"),
+        res.get("first_name", ""),
+    )
+
+
 def main() -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -297,6 +328,7 @@ def main() -> None:
         )
     logger.info("환경파일 경로: %s", _ROOT / ".env")
     logger.info("TELEGRAM_TOKEN 로드됨 (봇 id=%s)", TELEGRAM_TOKEN.split(":", 1)[0])
+    _verify_telegram_token(TELEGRAM_TOKEN)
     # PythonAnywhere ↔ api.telegram.org 구간이 불안정할 때 ReadError·NetworkError 완화
     app = (
         Application.builder()
