@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -20,10 +21,12 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+# 작업 디렉터리와 무관하게 main.py와 같은 폴더의 .env만 사용 (Always-on·경로 이슈 방지)
+_ROOT = Path(__file__).resolve().parent
+load_dotenv(_ROOT / ".env")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 # Anthropic HTTP: 응답 지연·네트워크 불안정 대비 (초). 생략 시 read 180 / connect 30
 _anthropic_read_timeout = float(os.getenv("ANTHROPIC_READ_TIMEOUT", "180"))
@@ -288,6 +291,12 @@ def main() -> None:
         raise ValueError(
             "TELEGRAM_TOKEN과 ANTHROPIC_API_KEY를 .env 파일에 설정해 주세요."
         )
+    if ":" not in TELEGRAM_TOKEN:
+        raise ValueError(
+            "TELEGRAM_TOKEN 형식이 잘못되었습니다. BotFather가 준 '숫자:문자열' 전체를 한 줄로 넣어 주세요."
+        )
+    logger.info("환경파일 경로: %s", _ROOT / ".env")
+    logger.info("TELEGRAM_TOKEN 로드됨 (봇 id=%s)", TELEGRAM_TOKEN.split(":", 1)[0])
     # PythonAnywhere ↔ api.telegram.org 구간이 불안정할 때 ReadError·NetworkError 완화
     app = (
         Application.builder()
