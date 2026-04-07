@@ -12,7 +12,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from anthropic import (
@@ -86,6 +86,18 @@ def _get_anthropic() -> AsyncAnthropic:
     return _anthropic_client
 
 
+def _anthropic_error_detail_text(exc: BaseException) -> str:
+    """Messages API 오류 JSON의 error.message 추출(로그·사용자 안내용)."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()
+    return ""
+
+
 def _runtime_message_for_translation_api_error(exc: BaseException) -> Optional[str]:
     """Anthropic/HTTP 오류를 사용자용 한국어로. None이면 원인 불명으로 간주."""
     if isinstance(exc, AuthenticationError):
@@ -104,10 +116,13 @@ def _runtime_message_for_translation_api_error(exc: BaseException) -> Optional[s
             "예: claude-sonnet-4-20250514, claude-3-5-sonnet-20241022"
         )
     if isinstance(exc, BadRequestError):
-        return (
-            "번역 요청이 API에서 거절되었습니다(400). "
-            "서버 로그에 상세 사유가 기록됩니다. 모델명·요청 내용을 확인해 주세요."
-        )
+        detail = _anthropic_error_detail_text(exc)
+        base = "번역 요청이 API에서 거절되었습니다(400)."
+        if detail:
+            if len(detail) > 300:
+                detail = detail[:297] + "..."
+            return f"{base} 사유: {detail}"
+        return base + " 서버 로그를 확인해 주세요."
     if isinstance(exc, RateLimitError):
         return (
             "Anthropic API 요청 한도에 걸렸습니다(429). "
@@ -161,6 +176,16 @@ def _is_english_only_message(text: str) -> bool:
     if _hangul_len(text) > 0 or _hanzi_len(text) > 0:
         return False
     return bool(re.search(r"[A-Za-z]", text))
+
+
+def _first_text_block_from_response(response: Any) -> Optional[str]:
+    """응답 content에서 첫 text 블록만 사용(4.x thinking 블록이 앞에 올 수 있음)."""
+    blocks = getattr(response, "content", None) or []
+    for block in blocks:
+        t = getattr(block, "text", None)
+        if isinstance(t, str) and t.strip():
+            return t
+    return None
 
 
 def _strip_bilingual_artifact(reply: str) -> str:
@@ -418,22 +443,29 @@ async def translate_with_claude(
         try_next_model = False
         for attempt in range(max_attempts):
             try:
+                # temperature 미지정: Claude 4.x 계열은 temperature+top_p 동시 지정 시 400이 나는 경우가 있어
+                # SDK/게이트웨이 조합을 피하고 API 기본 샘플링을 씀.
                 response = await client.messages.create(
                     model=model_name,
-                    max_tokens=512,
-                    temperature=0.1,
+                    max_tokens=1024,
                     system=TRANSLATION_SYSTEM,
                     messages=[{"role": "user", "content": user_content}],
                 )
-                if not response.content or not hasattr(response.content[0], "text"):
+                raw_text = _first_text_block_from_response(response)
+                if not raw_text:
                     return "번역 결과를 가져오지 못했습니다."
-                raw = _strip_bilingual_artifact(response.content[0].text)
+                raw = _strip_bilingual_artifact(raw_text)
                 out = _strip_source_language_echo(text, raw)
                 return _assert_pure_target_script(text, out)
             except (AuthenticationError, PermissionDeniedError) as e:
                 msg = _runtime_message_for_translation_api_error(e) or str(e)
                 raise RuntimeError(msg) from e
             except BadRequestError as e:
+                logger.error(
+                    "Anthropic 400 model=%s body=%r",
+                    model_name,
+                    getattr(e, "body", None),
+                )
                 msg = _runtime_message_for_translation_api_error(e) or str(e)
                 raise RuntimeError(msg) from e
             except NotFoundError as e:
