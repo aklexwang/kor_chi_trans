@@ -3,6 +3,7 @@
 - 한국어 → 중국어, 중국어 → 한국어 자동 감지 후 번역본만 답장
 - 한글·한자 없이 영어만 있으면 API 없이 영어 원문 그대로 답장
 - .env의 ALLOWED_USER_IDS / ALLOWED_CHAT_IDS 로 허용 사용자·채팅만 사용 가능(비우면 전체 공개)
+- REQUIRE_USER_PRESENT_ID 로 특정 user id가 방에 있을 때만 그룹에서 동작(1:1은 그 사람만)
 - 일반 텍스트 + 사진/동영상 등 캡션(caption) 동일 처리
 - Claude Sonnet + python-telegram-bot v21
 """
@@ -28,8 +29,14 @@ from anthropic import (
     RateLimitError,
 )
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.error import Conflict, NetworkError, TimedOut
+from telegram import (
+    ChatMemberAdministrator,
+    ChatMemberMember,
+    ChatMemberOwner,
+    ChatMemberRestricted,
+    Update,
+)
+from telegram.error import BadRequest, Conflict, NetworkError, TelegramError, TimedOut
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 logger = logging.getLogger(__name__)
@@ -66,6 +73,21 @@ def _env_int_id_set(var: str) -> frozenset[int]:
 # 비어 있으면 제한 없음(누구나 사용). 하나라도 넣으면 화이트리스트만 허용.
 ALLOWED_USER_IDS = _env_int_id_set("ALLOWED_USER_IDS")
 ALLOWED_CHAT_IDS = _env_int_id_set("ALLOWED_CHAT_IDS")
+
+
+def _env_optional_user_id(var: str) -> Optional[int]:
+    raw = (os.getenv(var) or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("%s는 정수 user id여야 합니다. 무시: %r", var, raw)
+        return None
+
+
+# 설정 시: 그룹에서는 이 user id가 멤버로 있는 방에서만 동작. 1:1은 그 사람이 봇에게 쓸 때만 허용.
+REQUIRE_USER_PRESENT_ID: Optional[int] = _env_optional_user_id("REQUIRE_USER_PRESENT_ID")
 
 _anthropic_client: Optional[AsyncAnthropic] = None
 
@@ -583,6 +605,42 @@ _ACCESS_DENIED_TEXT = (
     "이 봇은 허용된 사용자·채팅방에서만 쓸 수 있습니다. 관리자에게 문의하세요."
 )
 
+_ACCESS_DENIED_PRESENCE_TEXT = (
+    "이 봇은 지정된 멤버가 참여 중인 채팅에서만 동작합니다."
+)
+
+_GOOD_CHAT_MEMBER_TYPES = (
+    ChatMemberOwner,
+    ChatMemberAdministrator,
+    ChatMemberMember,
+    ChatMemberRestricted,
+)
+
+
+async def _telegram_required_user_in_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, required_user_id: int
+) -> bool:
+    """필수 멤버가 이 대화에 있는지 확인. 1:1은 발신자가 본인일 때만 True."""
+    c = update.effective_chat
+    if c is None:
+        return False
+    if c.type == "private":
+        u = update.effective_user
+        return u is not None and u.id == required_user_id
+    if c.type in ("group", "supergroup"):
+        try:
+            m = await context.bot.get_chat_member(c.id, required_user_id)
+        except (BadRequest, TelegramError) as e:
+            logger.info(
+                "get_chat_member 실패(필수 멤버 확인 불가 → 거부): chat_id=%s err=%s",
+                c.id,
+                e,
+            )
+            return False
+        return isinstance(m, _GOOD_CHAT_MEMBER_TYPES)
+    # 채널 등 기타: 멤버십 확인이 애매하면 사용 안 함
+    return False
+
 
 def _telegram_access_allowed(update: Update) -> bool:
     """ALLOWED_USER_IDS / ALLOWED_CHAT_IDS 가 모두 비어 있으면 제한 없음. 하나라도 있으면 화이트리스트만."""
@@ -625,6 +683,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             pass
         return
+    if REQUIRE_USER_PRESENT_ID is not None:
+        if not await _telegram_required_user_in_chat(
+            update, context, REQUIRE_USER_PRESENT_ID
+        ):
+            logger.info(
+                "필수 멤버 미참여 chat_id=%s type=%s sender_id=%s required_id=%s",
+                getattr(update.effective_chat, "id", None),
+                getattr(update.effective_chat, "type", None),
+                getattr(update.effective_user, "id", None),
+                REQUIRE_USER_PRESENT_ID,
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=_ACCESS_DENIED_PRESENCE_TEXT,
+                )
+            except (TimedOut, NetworkError):
+                pass
+            except Exception:
+                pass
+            return
     _log_incoming_request(update, user_text)
     reply_context: Optional[str] = None
     if update.message.reply_to_message:
@@ -771,6 +850,11 @@ def main() -> None:
         )
     else:
         logger.info("텔레그램 접근 제한 없음(ALLOWED_USER_IDS/ALLOWED_CHAT_IDS 비어 있음)")
+    if REQUIRE_USER_PRESENT_ID is not None:
+        logger.info(
+            "필수 멤버 모드: user_id=%s 가 참여한 그룹·슈퍼그룹에서만 동작(1:1은 본인만)",
+            REQUIRE_USER_PRESENT_ID,
+        )
     _verify_telegram_token(TELEGRAM_TOKEN)
     # PythonAnywhere ↔ api.telegram.org 구간이 불안정할 때 ReadError·NetworkError 완화
     app = (
