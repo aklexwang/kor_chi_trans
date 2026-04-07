@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import difflib
 import logging
 import os
 import re
@@ -13,7 +14,17 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from anthropic import APITimeoutError, AsyncAnthropic
+from anthropic import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncAnthropic,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import Conflict, NetworkError, TimedOut
@@ -27,12 +38,32 @@ load_dotenv(_ROOT / ".env")
 
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL = (os.getenv("CLAUDE_MODEL") or "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
 # Anthropic HTTP: 응답 지연·네트워크 불안정 대비 (초). 생략 시 read 180 / connect 30
 _anthropic_read_timeout = float(os.getenv("ANTHROPIC_READ_TIMEOUT", "180"))
 _anthropic_connect_timeout = float(os.getenv("ANTHROPIC_CONNECT_TIMEOUT", "30"))
 
 _anthropic_client: Optional[AsyncAnthropic] = None
+
+
+def _anthropic_model_candidates() -> list[str]:
+    """우선 CLAUDE_MODEL, API가 404일 때만 콤마 구분 폴백(기본: 널리 쓰이는 스냅샷) 순서로 시도."""
+    primary = CLAUDE_MODEL
+    raw_fb = (os.getenv("CLAUDE_MODEL_FALLBACK") or "").strip()
+    if not raw_fb:
+        raw_fb = "claude-sonnet-4-20250514,claude-3-5-sonnet-20241022"
+    extras = [x.strip() for x in raw_fb.split(",") if x.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in [primary, *extras]:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+class TranslationValidationError(RuntimeError):
+    """모델 출력이 타깃 언어/형식 규칙을 위반했을 때 내부 재시도용 예외."""
 
 
 def _anthropic_http_timeout() -> httpx.Timeout:
@@ -54,14 +85,59 @@ def _get_anthropic() -> AsyncAnthropic:
     return _anthropic_client
 
 
+def _runtime_message_for_translation_api_error(exc: BaseException) -> Optional[str]:
+    """Anthropic/HTTP 오류를 사용자용 한국어로. None이면 원인 불명으로 간주."""
+    if isinstance(exc, AuthenticationError):
+        return (
+            "Anthropic API 키가 인증되지 않았습니다. .env의 ANTHROPIC_API_KEY를 "
+            "console.anthropic.com 에서 복사한 값으로 다시 넣어 주세요(따옴표·앞뒤 공백 없음)."
+        )
+    if isinstance(exc, PermissionDeniedError):
+        return (
+            "Anthropic API 사용이 거부되었습니다(403). 계정·결제·조직 정책을 콘솔에서 확인해 주세요."
+        )
+    if isinstance(exc, NotFoundError):
+        return (
+            "지정한 Claude 모델을 API에서 찾을 수 없습니다(404). "
+            f".env의 CLAUDE_MODEL(현재: {CLAUDE_MODEL})을 계정에서 지원하는 모델 ID로 바꿔 주세요. "
+            "예: claude-sonnet-4-20250514, claude-3-5-sonnet-20241022"
+        )
+    if isinstance(exc, BadRequestError):
+        return (
+            "번역 요청이 API에서 거절되었습니다(400). "
+            "서버 로그에 상세 사유가 기록됩니다. 모델명·요청 내용을 확인해 주세요."
+        )
+    if isinstance(exc, RateLimitError):
+        return (
+            "Anthropic API 요청 한도에 걸렸습니다(429). "
+            "잠시 후 다시 시도하거나 호출 빈도를 줄여 주세요."
+        )
+    if isinstance(exc, APIStatusError):
+        if 500 <= exc.status_code < 600 or exc.status_code == 529:
+            return "현재 번역 서버가 혼잡합니다. 잠시 후 다시 시도해 주세요."
+        if 400 <= exc.status_code < 500:
+            return (
+                f"번역 API 오류(HTTP {exc.status_code})입니다. "
+                "서버 로그를 확인하거나 잠시 후 다시 시도해 주세요."
+            )
+    if isinstance(exc, APIConnectionError):
+        return "번역 API에 연결하지 못했습니다. 네트워크를 확인하고 잠시 후 다시 시도해 주세요."
+    return None
+
+
 def _format_user_error(exc: BaseException) -> str:
     """타임아웃·일시 오류는 한국어 안내로 통일."""
     friendly = "현재 번역 서버가 혼잡합니다. 잠시 후 다시 시도해 주세요."
+    raw = str(exc).lower()
+    if "credit balance is too low" in raw or "purchase credits" in raw:
+        return (
+            "Anthropic API 크레딧이 부족합니다. "
+            "콘솔의 Plans & Billing에서 크레딧을 충전한 뒤 다시 시도해 주세요."
+        )
     if isinstance(exc, (APITimeoutError, asyncio.TimeoutError)):
         return friendly
     if isinstance(exc, httpx.TimeoutException):
         return friendly
-    raw = str(exc).lower()
     if "timed out" in raw or "timeout" in raw:
         return friendly
     if "overloaded" in raw or "529" in str(exc):
@@ -85,6 +161,136 @@ def _strip_bilingual_artifact(reply: str) -> str:
     chunks = re.split(r"\n\s*-{3,}\s*\n", t)
     if len(chunks) >= 2:
         return chunks[-1].strip()
+    return t
+
+
+def _hangul_len(s: str) -> int:
+    return len(re.findall(r"[\uAC00-\uD7A3]", s))
+
+
+def _hanzi_len(s: str) -> int:
+    return len(re.findall(r"[\u4e00-\u9FFF]", s))
+
+
+def _squish_ws(s: str) -> str:
+    return re.sub(r"\s+", "", s)
+
+
+def _utterance_near_duplicate(a: str, b: str, threshold: float = 0.88) -> bool:
+    """모델이 원문을 한 줄 더 붙인 경우(거의 동일 문장) 제거용."""
+    x, y = _squish_ws(a), _squish_ws(b)
+    if not x or not y:
+        return False
+    if x == y:
+        return True
+    if min(len(x), len(y)) < 6:
+        return x == y
+    return difflib.SequenceMatcher(None, x, y).ratio() >= threshold
+
+
+def _strip_source_language_echo(user_text: str, reply: str) -> str:
+    """한→중인데 한글 줄을 그대로 붙이거나, 중→한인데 한 줄이 원문 복제인 경우 제거."""
+    reply = reply.strip()
+    if not reply:
+        return reply
+    h_in, z_in = _hangul_len(user_text), _hanzi_len(user_text)
+    if h_in == 0 and z_in == 0:
+        return reply
+    target_zh = h_in > z_in
+    target_ko = z_in > h_in
+    if not target_zh and not target_ko:
+        return reply
+
+    lines = [ln.strip() for ln in reply.split("\n") if ln.strip()]
+    if not lines:
+        return reply
+
+    if target_zh:
+        kept: list[str] = []
+        for ln in lines:
+            if _utterance_near_duplicate(ln, user_text):
+                continue
+            hg, hz = _hangul_len(ln), _hanzi_len(ln)
+            if hg > 0 and hz == 0:
+                continue
+            if hz > hg:
+                kept.append(ln)
+        if kept:
+            return "\n".join(kept).strip()
+        # 한 줄에 한글+한자 혼용(예: "한 시간만 睡一觉")은 통과시키지 않음 — 순수 한자(중국어) 줄만 후보
+        candidates = [
+            ln
+            for ln in lines
+            if _hanzi_len(ln) > 0
+            and _hangul_len(ln) == 0
+            and not _utterance_near_duplicate(ln, user_text)
+        ]
+        if candidates:
+            return max(
+                candidates,
+                key=lambda ln: (_hanzi_len(ln), -_hangul_len(ln)),
+            ).strip()
+        # 한→중인데 모델이 한국어로만 답한 경우 사용자에게 노출하지 않고 재시도
+        if _hangul_len(reply) > _hanzi_len(reply):
+            logger.warning(
+                "한→중 요청인데 응답이 한국어 위주(재시도): %r",
+                reply[:160],
+            )
+            raise TranslationValidationError(
+                "expected_chinese_only_but_got_korean"
+            )
+        return reply
+
+    kept_ko: list[str] = []
+    for ln in lines:
+        if _utterance_near_duplicate(ln, user_text):
+            continue
+        hg, hz = _hangul_len(ln), _hanzi_len(ln)
+        if hz > 0 and hg == 0:
+            continue
+        if hg > hz:
+            kept_ko.append(ln)
+    if kept_ko:
+        return "\n".join(kept_ko).strip()
+    candidates_ko = [
+        ln
+        for ln in lines
+        if _hangul_len(ln) > 0 and not _utterance_near_duplicate(ln, user_text)
+    ]
+    if candidates_ko:
+        return max(
+            candidates_ko,
+            key=lambda ln: (_hangul_len(ln) - _hanzi_len(ln), _hangul_len(ln)),
+        ).strip()
+    if _hanzi_len(reply) > _hangul_len(reply):
+        logger.warning(
+            "중→한 요청인데 응답이 중국어 위주(재시도): %r",
+            reply[:160],
+        )
+        raise TranslationValidationError("expected_korean_only_but_got_chinese")
+    return reply
+
+
+def _assert_pure_target_script(user_text: str, translated: str) -> str:
+    """한→중이면 출력에 한글 음절 1개도 없어야 함. 중→한이면 한자만인 출력 등은 거부."""
+    t = translated.strip()
+    if not t:
+        return t
+    h_in, z_in = _hangul_len(user_text), _hanzi_len(user_text)
+    if not (h_in > z_in or z_in > h_in):
+        return t
+    if h_in > z_in:
+        if _hangul_len(t) > 0:
+            logger.warning("한→중인데 번역에 한글 잔류: %r", t[:200])
+            raise TranslationValidationError("hangul_found_in_chinese_output")
+        return t
+    if z_in > h_in:
+        if _hangul_len(t) == 0 and _hanzi_len(t) > 0:
+            logger.warning("중→한인데 출력이 한자만: %r", t[:200])
+            raise TranslationValidationError("hanzi_only_in_korean_output")
+        if _hanzi_len(t) > _hangul_len(t):
+            logger.warning("중→한인데 출력에 한자 비중이 더 큼: %r", t[:200])
+            raise TranslationValidationError("hanzi_dominant_in_korean_output")
     return t
 
 
@@ -121,10 +327,26 @@ TRANSLATION_SYSTEM = """You are a professional Korean–Chinese interpreter who 
 
 Your job is NOT literal word-for-word translation, but you **only interpret what the user actually said** into the other language—same speech act (question stays a question, command stays a command, statement stays a statement). Use natural spoken phrasing: fillers, idioms, word order as a native would say it out loud. Avoid stiff written Chinese (文绉绉), dictionary-ish phrasing, and awkward calques.
 
+**Correct output language (non-negotiable):**
+- **Korean source** → output **Chinese only** (口语, Hanzi). **Never** answer in Korean. **Never** “rephrase” Korean into different Korean (same-language rewriting is forbidden).
+- **Chinese source** → output **Korean only** (Hangul). **Never** answer in Chinese. **Never** “rephrase” Chinese into different Chinese.
+- **Zero Hangul in Chinese output:** If the source is Korean, **every** meaningful part must be in Chinese. **Wrong:** **한 시간만 睡一觉。** (Korean time phrase + Chinese verb). **Right:** one full 口语 sentence such as **我就睡一个小时。** / **我睡一个小时就行。** — **no** Hangul letters anywhere in your reply.
+
+**Tone, respect, and propositional fidelity:**
+- You are interpreting for people who **do not share a language**: the other side will read your output. Keep the **same meaning and degree of criticism** as the source—do **not** weaken facts or deny what the speaker said.
+- **Do not escalate vulgarity or swap insults** for different, harsher ones (e.g. do **not** turn **그지같다**-level wording into **개같다** or other stronger slurs). Match strength; do not “spice up.”
+- Where the source is rough but the idea is “very bad / terrible (work style, attitude),” prefer natural target-language equivalents that convey that judgment **without** piling gratuitous extra offense toward the listener’s face—still **honest** to the speaker’s intent (e.g. work style “真差劲 / 真不像话 / 太差了” style 口语, not inventing new attacks).
+
 **You are an interpreter, not a Q&A assistant.** Never answer the user's question, never supply facts, geography, explanations, or advice they did not say. Do not "helpfully" respond to what they asked—only translate their **words** (their utterance) into the target language.
 - Korean question (e.g. **한국은 어디 있니?**) → Chinese must be the **same question** in natural 口语 (e.g. **韩国在哪儿啊？** / **韩国在什么地方？**), **not** an answer like **韩国在亚洲东部…**.
 - Chinese question → Korean must stay a **question** in 구어체, not an answer.
 - Same for commands, complaints, small talk: output only the equivalent utterance, with no added content.
+
+**Faithfulness and zero hallucination (mandatory):**
+- Every situation you describe in the translation must appear in the source. **Never** invent body parts, senses, disabilities, medical states, or random plot details (e.g. if the source does **not** mention vision, **never** output Korean like **눈이 안 보여** or any “can’t see” wording).
+- **Never** add parenthetical glosses or alternatives the speaker did not say (no **(혹은 …)**, no “or it could mean…”, no footnotes).
+- **稍等 / 等一下 / 你稍等我 / 你等我(一下)** = “wait a moment” / “wait for me (a bit).” Natural Korean examples: **잠깐만 기다려 주세요**, **당신은 나를 잠시만 기다려 주세요**, **나 좀만 기다려줘** (match **你** politeness). **Wrong:** any unrelated scenario (blindness, “I can’t see,” etc.).
+- **稍等我问下 … 几个人** (asking how many people **妹妹** is coming with): keep **妹妹** as **여동생** (or **그 여동생**) as context implies; use natural **몇 명이랑 같이 오는지**-style wording. Do **not** over-explain kinship with extra parentheses.
 
 - Korean input → output only in natural spoken Chinese (口语). Match formality to the message (chatty stays chatty; polite/formal stays appropriately polite but still sounds like real speech).
 - Chinese input (Simplified or Traditional) → output only in natural spoken Korean (구어체), same principles.
@@ -136,6 +358,19 @@ Short replies about already knowing / being aware (very common in chat):
 Pronouns and "who acts on whom" (do not flip perspective):
 - Chinese **他 / 她 / 他们 / 人家** and Korean **그 / 그녀 / 그들 / 걔 / 쟤** refer to **third parties** unless context clearly says otherwise. **Never** render **他** (him/her) as **나** (me) or **我** as the object of **问** when the source means asking **another person**. Example: **我问他一下** = "I'll ask him / let me ask him" → natural Korean e.g. **그한테 물어볼게**, **걔한테 한번 물어볼게** — **not** **나한테 물어볼게** (that means asking oneself). Same care for **你/您 ↔ 너/당신**, **我 ↔ 나/저**: keep subject/object roles aligned with the source.
 
+Language choice (critical):
+- If the message is **mostly Korean** (hangul dominates) → output **Chinese only** (口语).
+- If the message is **mostly Chinese** (hanzi dominates) → output **Korean only** (구어체).
+- Never output **English** except unavoidable proper nouns/brand names as natives would leave them.
+- If Korean and Chinese are mixed in one message, translate each segment into the other language so the whole reply reads naturally in **one** target language (do not leave one language untranslated).
+
+**Single-script output (no echo, no bilingual lines):**
+- **Never** repeat the user’s message in the source script. Do **not** put Korean on the first line and Chinese on the second (that is forbidden). The entire reply must be **only** the target language.
+- Do **not** mix Hangul and Hanzi inside one word or token (wrong: **관心도**). Write normal **关心** / **关心度** in pure Chinese, or pure Korean **관심도**—never hybrid spellings.
+
+**Context (when a “replied-to” block is provided):**
+- That block is **only** for disambiguation (who is 他, topic continuity). **Do not** translate it as the main output, **do not** reply to it with unrelated sentences, and **do not** output lines that belong only to the context (e.g. if the final utterance to translate does not say “没兴趣做这件事,” you must **not** output that). **Only** the **last** utterance in the user message—the one explicitly marked as what to translate—gets rendered into the other language.
+
 Reply with ONLY the translation in the target language: one single continuous reply. Do not echo, repeat, "correct", normalize, or rewrite the source text. Never output the source language at all (no bilingual pairs, no "original / translation" layout). Do not use --- or any separator to show two versions. Do not change the user's Arabic numerals into Chinese characters in any echoed text—because you must not echo the source. No explanations, no labels, no quotation marks. Use line breaks only if the original clearly uses multiple lines."""
 
 
@@ -143,47 +378,139 @@ async def translate_with_claude(
     text: str, reply_context: Optional[str] = None
 ) -> str:
     """Claude로 한↔중 자동 감지 후 번역. reply_context가 있으면 답장 대상 문맥을 함께 전달."""
+    # 문맥은 한국어로 쓰이면 모델이 문맥까지 중국어로 번역하는 경우가 있어, 영어 메타 지시로 분리
     if reply_context:
-        user_content = f"이전 메시지 문맥: {reply_context}\n\n{text}"
+        user_content = (
+            "Context from the message being replied to (for disambiguation only; "
+            "do NOT translate this block as your answer, do NOT respond to it, "
+            "and do NOT output sentences that appear only in this block):\n"
+            f"{reply_context}\n\n"
+            "Translate ONLY the following final utterance into the other language "
+            "(Korean ↔ spoken Chinese). Your entire reply must be that translation "
+            "and nothing else:\n"
+            f"{text}"
+        )
     else:
-        user_content = text
+        user_content = (
+            "Translate ONLY the following utterance into the other language "
+            "(Korean ↔ spoken Chinese). Output nothing else:\n"
+            f"{text}"
+        )
     client = _get_anthropic()
-
+    base_user_content = user_content
+    models = _anthropic_model_candidates()
     last_error: Optional[Exception] = None
-    max_attempts = 3
-    retry_delays = [1.2, 2.5]  # 1차 실패 후 1.2초, 2차 실패 후 2.5초 대기
+    max_attempts = 4
+    retry_delays = [1.0, 2.0, 3.0]
 
-    for attempt in range(max_attempts):
-        try:
-            response = await client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=512,
-                system=TRANSLATION_SYSTEM,
-                messages=[{"role": "user", "content": user_content}],
-            )
-            if not response.content or not hasattr(response.content[0], "text"):
-                return "번역 결과를 가져오지 못했습니다."
-            return _strip_bilingual_artifact(response.content[0].text)
-        except Exception as e:
-            last_error = e
-            # API 529/overloaded, 429, 일시적 네트워크 오류 등은 재시도
-            error_text = str(e).lower()
-            status_code = getattr(e, "status_code", None)
-            retryable = (
-                status_code in {429, 500, 502, 503, 504, 529}
-                or "overloaded" in error_text
-                or "timeout" in error_text
-                or "connection" in error_text
-                or "temporarily unavailable" in error_text
-            )
-            if not retryable or attempt == max_attempts - 1:
+    for model_name in models:
+        user_content = base_user_content
+        try_next_model = False
+        for attempt in range(max_attempts):
+            try:
+                response = await client.messages.create(
+                    model=model_name,
+                    max_tokens=512,
+                    temperature=0.1,
+                    system=TRANSLATION_SYSTEM,
+                    messages=[{"role": "user", "content": user_content}],
+                )
+                if not response.content or not hasattr(response.content[0], "text"):
+                    return "번역 결과를 가져오지 못했습니다."
+                raw = _strip_bilingual_artifact(response.content[0].text)
+                out = _strip_source_language_echo(text, raw)
+                return _assert_pure_target_script(text, out)
+            except (AuthenticationError, PermissionDeniedError) as e:
+                msg = _runtime_message_for_translation_api_error(e) or str(e)
+                raise RuntimeError(msg) from e
+            except BadRequestError as e:
+                msg = _runtime_message_for_translation_api_error(e) or str(e)
+                raise RuntimeError(msg) from e
+            except NotFoundError as e:
+                last_error = e
+                logger.warning(
+                    "Claude 모델 404(%s) — 다음 후보 시도: %s",
+                    model_name,
+                    models,
+                )
+                try_next_model = True
                 break
-            await asyncio.sleep(retry_delays[attempt])
+            except Exception as e:
+                last_error = e
+                lowered = str(e).lower()
+                if "credit balance is too low" in lowered or "purchase credits" in lowered:
+                    raise RuntimeError(
+                        "Anthropic API 크레딧이 부족합니다. "
+                        "Plans & Billing에서 충전 후 다시 시도해 주세요."
+                    ) from e
+                error_text = lowered
+                status_code = getattr(e, "status_code", None)
+                retryable = (
+                    isinstance(e, TranslationValidationError)
+                    or status_code
+                    in {429, 500, 502, 503, 504, 529}
+                    or "overloaded" in error_text
+                    or "timeout" in error_text
+                    or "connection" in error_text
+                    or "temporarily unavailable" in error_text
+                )
+                if not retryable or attempt == max_attempts - 1:
+                    break
+                if isinstance(e, TranslationValidationError):
+                    h_in, z_in = _hangul_len(text), _hanzi_len(text)
+                    if h_in > z_in:
+                        user_content = (
+                            "Korean source detected. Retry now.\n"
+                            "Output MUST be Chinese (Hanzi) only.\n"
+                            "Do not output any Hangul, labels, explanations, or source echo.\n"
+                            "Translate this utterance only:\n"
+                            f"{text}"
+                        )
+                    elif z_in > h_in:
+                        user_content = (
+                            "Chinese source detected. Retry now.\n"
+                            "Output MUST be Korean (Hangul) only.\n"
+                            "Do not output Chinese characters, labels, explanations, or source echo.\n"
+                            "Translate this utterance only:\n"
+                            f"{text}"
+                        )
+                await asyncio.sleep(retry_delays[attempt])
+        if try_next_model:
+            continue
+        break
 
     if last_error:
-        raise RuntimeError(
-            "현재 번역 서버가 혼잡합니다. 잠시 후 다시 시도해 주세요."
-        ) from last_error
+        if isinstance(last_error, TranslationValidationError):
+            raise RuntimeError(
+                "번역 결과가 불안정했습니다. 같은 문장을 한 번 더 보내 주세요."
+            ) from last_error
+        if isinstance(last_error, NotFoundError):
+            user_msg = (
+                "Claude 모델을 API에서 찾을 수 없습니다(404). "
+                f"시도한 모델: {', '.join(models)}. "
+                "Anthropic 콘솔에서 계정에 열린 모델 ID를 확인해 주세요."
+            )
+            logger.error(user_msg, exc_info=last_error)
+            raise RuntimeError(user_msg) from last_error
+        user_msg = _runtime_message_for_translation_api_error(last_error)
+        if user_msg is None:
+            logger.error(
+                "translate_with_claude 실패(원인 분류 불가). models=%s err=%r",
+                models,
+                last_error,
+                exc_info=last_error,
+            )
+            user_msg = (
+                "번역 중 오류가 발생했습니다. 서버 로그를 확인해 주세요. "
+                "(API 키·모델명·네트워크 문제일 수 있습니다.)"
+            )
+        else:
+            logger.warning(
+                "translate_with_claude 최종 실패: models=%s %s",
+                models,
+                last_error,
+            )
+        raise RuntimeError(user_msg) from last_error
     raise RuntimeError("번역 중 알 수 없는 오류가 발생했습니다.")
 
 
@@ -328,6 +655,10 @@ def main() -> None:
         )
     logger.info("환경파일 경로: %s", _ROOT / ".env")
     logger.info("TELEGRAM_TOKEN 로드됨 (봇 id=%s)", TELEGRAM_TOKEN.split(":", 1)[0])
+    logger.info(
+        "Claude 모델 시도 순서(404 시 자동 폴백): %s",
+        " → ".join(_anthropic_model_candidates()),
+    )
     _verify_telegram_token(TELEGRAM_TOKEN)
     # PythonAnywhere ↔ api.telegram.org 구간이 불안정할 때 ReadError·NetworkError 완화
     app = (
