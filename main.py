@@ -1,6 +1,7 @@
 """
 텔레그램 실시간 통역 봇
 - 한국어 → 중국어, 중국어 → 한국어 자동 감지 후 번역본만 답장
+- 한글·한자 없이 영어만 있으면 API 없이 영어 원문 그대로 답장
 - 일반 텍스트 + 사진/동영상 등 캡션(caption) 동일 처리
 - Claude Sonnet + python-telegram-bot v21
 """
@@ -151,6 +152,15 @@ def _is_url_only_message(text: str) -> bool:
     if not t or "\n" in t:
         return False
     return bool(re.match(r"^https?://\S+$", t, re.IGNORECASE))
+
+
+def _is_english_only_message(text: str) -> bool:
+    """한글·한자가 없고 라틴 문자(A–Z)가 있으면 영어로 보고 번역 없이 그대로 답장."""
+    if not text.strip():
+        return False
+    if _hangul_len(text) > 0 or _hanzi_len(text) > 0:
+        return False
+    return bool(re.search(r"[A-Za-z]", text))
 
 
 def _strip_bilingual_artifact(reply: str) -> str:
@@ -526,7 +536,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message.reply_to_message:
         reply_context = _extract_message_text(update.message.reply_to_message)
 
-    if _is_url_only_message(user_text):
+    if _is_url_only_message(user_text) or _is_english_only_message(user_text):
         try:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
@@ -534,7 +544,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         except (TimedOut, NetworkError) as e:
             logger.warning(
-                "링크 전송 후 텔레그램 네트워크/타임아웃(이미 전달됐을 수 있음): %s",
+                "원문 그대로 전송 후 텔레그램 네트워크/타임아웃(이미 전달됐을 수 있음): %s",
                 e,
             )
         except Exception as e:
