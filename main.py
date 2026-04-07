@@ -2,6 +2,7 @@
 텔레그램 실시간 통역 봇
 - 한국어 → 중국어, 중국어 → 한국어 자동 감지 후 번역본만 답장
 - 한글·한자 없이 영어만 있으면 API 없이 영어 원문 그대로 답장
+- .env의 ALLOWED_USER_IDS / ALLOWED_CHAT_IDS 로 허용 사용자·채팅만 사용 가능(비우면 전체 공개)
 - 일반 텍스트 + 사진/동영상 등 캡션(caption) 동일 처리
 - Claude Sonnet + python-telegram-bot v21
 """
@@ -43,6 +44,28 @@ CLAUDE_MODEL = (os.getenv("CLAUDE_MODEL") or "claude-sonnet-4-6").strip() or "cl
 # Anthropic HTTP: 응답 지연·네트워크 불안정 대비 (초). 생략 시 read 180 / connect 30
 _anthropic_read_timeout = float(os.getenv("ANTHROPIC_READ_TIMEOUT", "180"))
 _anthropic_connect_timeout = float(os.getenv("ANTHROPIC_CONNECT_TIMEOUT", "30"))
+
+
+def _env_int_id_set(var: str) -> frozenset[int]:
+    """콤마로 구분된 정수 ID 목록(공백 무시). 잘못된 항목은 건너뜀."""
+    raw = (os.getenv(var) or "").strip()
+    if not raw:
+        return frozenset()
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            logger.warning("%s에 숫자가 아닌 값 무시: %r", var, part)
+    return frozenset(out)
+
+
+# 비어 있으면 제한 없음(누구나 사용). 하나라도 넣으면 화이트리스트만 허용.
+ALLOWED_USER_IDS = _env_int_id_set("ALLOWED_USER_IDS")
+ALLOWED_CHAT_IDS = _env_int_id_set("ALLOWED_CHAT_IDS")
 
 _anthropic_client: Optional[AsyncAnthropic] = None
 
@@ -556,12 +579,51 @@ async def translate_with_claude(
     raise RuntimeError("번역 중 알 수 없는 오류가 발생했습니다.")
 
 
+_ACCESS_DENIED_TEXT = (
+    "이 봇은 허용된 사용자·채팅방에서만 쓸 수 있습니다. 관리자에게 문의하세요."
+)
+
+
+def _telegram_access_allowed(update: Update) -> bool:
+    """ALLOWED_USER_IDS / ALLOWED_CHAT_IDS 가 모두 비어 있으면 제한 없음. 하나라도 있으면 화이트리스트만."""
+    if not ALLOWED_USER_IDS and not ALLOWED_CHAT_IDS:
+        return True
+    u = update.effective_user
+    c = update.effective_chat
+    uid = getattr(u, "id", None)
+    cid = getattr(c, "id", None)
+    if uid is None or cid is None:
+        return False
+    if ALLOWED_USER_IDS and not ALLOWED_CHAT_IDS:
+        return uid in ALLOWED_USER_IDS
+    if ALLOWED_CHAT_IDS and not ALLOWED_USER_IDS:
+        return cid in ALLOWED_CHAT_IDS
+    return uid in ALLOWED_USER_IDS or cid in ALLOWED_CHAT_IDS
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """텍스트 또는 미디어 캡션 수신 시 번역 후 답장."""
     if not update.message:
         return
     user_text = _extract_message_text(update.message)
     if not user_text:
+        return
+    if not _telegram_access_allowed(update):
+        logger.info(
+            "접근 거부 chat_id=%s user_id=%s username=%s",
+            getattr(update.effective_chat, "id", None),
+            getattr(update.effective_user, "id", None),
+            getattr(update.effective_user, "username", None),
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=_ACCESS_DENIED_TEXT,
+            )
+        except (TimedOut, NetworkError):
+            pass
+        except Exception:
+            pass
         return
     _log_incoming_request(update, user_text)
     reply_context: Optional[str] = None
@@ -701,6 +763,14 @@ def main() -> None:
         "Claude 모델 시도 순서(404 시 자동 폴백): %s",
         " → ".join(_anthropic_model_candidates()),
     )
+    if ALLOWED_USER_IDS or ALLOWED_CHAT_IDS:
+        logger.info(
+            "텔레그램 접근 제한 활성화: 허용 user_ids=%s chat_ids=%s",
+            sorted(ALLOWED_USER_IDS) if ALLOWED_USER_IDS else "(미사용)",
+            sorted(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else "(미사용)",
+        )
+    else:
+        logger.info("텔레그램 접근 제한 없음(ALLOWED_USER_IDS/ALLOWED_CHAT_IDS 비어 있음)")
     _verify_telegram_token(TELEGRAM_TOKEN)
     # PythonAnywhere ↔ api.telegram.org 구간이 불안정할 때 ReadError·NetworkError 완화
     app = (
