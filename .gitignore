@@ -20,3 +20,10 @@ build/
 .vscode/
 *.swp
 *.swo
+
+# 배포 압축(로컬 생성)
+interpreting_pa_*.zip
+dist/
+
+# TOTP 인증된 사용자 목록(서버 로컬)
+data/

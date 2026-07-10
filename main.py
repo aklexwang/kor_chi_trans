@@ -4,6 +4,7 @@
 - 한글·한자 없이 영어만 있으면 API 없이 영어 원문 그대로 답장
 - .env의 ALLOWED_USER_IDS / ALLOWED_CHAT_IDS 로 허용 사용자·채팅만 사용 가능(비우면 전체 공개)
 - REQUIRE_USER_PRESENT_ID 로 특정 user id가 방에 있을 때만 그룹에서 동작(1:1은 그 사람만)
+- ENABLE_TOTP_AUTH + TOTP_SECRET 으로 Google Authenticator 6자리 코드 인증
 - 일반 텍스트 + 사진/동영상 등 캡션(caption) 동일 처리
 - Claude Sonnet + python-telegram-bot v21
 """
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+from access_control import TotpAccessControl
 from anthropic import (
     APIConnectionError,
     APIStatusError,
@@ -37,7 +39,7 @@ from telegram import (
     Update,
 )
 from telegram.error import BadRequest, Conflict, NetworkError, TelegramError, TimedOut
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,7 @@ def _env_int_id_set(var: str) -> frozenset[int]:
 # 비어 있으면 제한 없음(누구나 사용). 하나라도 넣으면 화이트리스트만 허용.
 ALLOWED_USER_IDS = _env_int_id_set("ALLOWED_USER_IDS")
 ALLOWED_CHAT_IDS = _env_int_id_set("ALLOWED_CHAT_IDS")
+ADMIN_USER_IDS = _env_int_id_set("ADMIN_USER_IDS")
 
 
 def _env_optional_user_id(var: str) -> Optional[int]:
@@ -88,6 +91,38 @@ def _env_optional_user_id(var: str) -> Optional[int]:
 
 # 설정 시: 그룹에서는 이 user id가 멤버로 있는 방에서만 동작. 1:1은 그 사람이 봇에게 쓸 때만 허용.
 REQUIRE_USER_PRESENT_ID: Optional[int] = _env_optional_user_id("REQUIRE_USER_PRESENT_ID")
+
+def _env_bool(var: str, default: bool = False) -> bool:
+    raw = (os.getenv(var) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_int(var: str, default: int) -> int:
+    raw = (os.getenv(var) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("%s는 정수여야 합니다. 기본값 %s 사용: %r", var, default, raw)
+        return default
+
+
+_totp_secret = (os.getenv("TOTP_SECRET") or "").strip()
+_totp_enabled = bool(_totp_secret) and _env_bool("ENABLE_TOTP_AUTH", True)
+
+TOTP_ACCESS = TotpAccessControl(
+    store_path=_ROOT / "data" / "authorized_users.json",
+    secret=_totp_secret,
+    enabled=_totp_enabled,
+    session_hours=_env_int("OTP_SESSION_HOURS", 24),
+    valid_window=_env_int("OTP_VALID_WINDOW", 1),
+    issuer=(os.getenv("TOTP_ISSUER") or "KorChiTrans Bot").strip(),
+    max_failures=_env_int("OTP_MAX_FAILURES", 5),
+    lockout_minutes=_env_int("OTP_LOCKOUT_MINUTES", 15),
+)
 
 _anthropic_client: Optional[AsyncAnthropic] = None
 
@@ -407,6 +442,11 @@ TRANSLATION_SYSTEM = """You are a professional Korean–Chinese interpreter who 
 
 Your job is NOT literal word-for-word translation, but you **only interpret what the user actually said** into the other language—same speech act (question stays a question, command stays a command, statement stays a statement). Use natural spoken phrasing: fillers, idioms, word order as a native would say it out loud. Avoid stiff written Chinese (文绉绉), dictionary-ish phrasing, and awkward calques.
 
+**Default register — polite, respectful, face-saving (정중·礼貌):** Unless the user message is **obviously** intimate, jokey, or intentionally crude among peers, **default to a courteous, respectful tone** in the *target* language. Do not “sanitize” facts, criticism, or anger—the **content** must stay faithful—but wrap it in what natives would call **得体的** / **정중한** phrasing.
+- **Chinese output (target):** Prefer 礼貌的口语, not brusque bare imperatives. Natural softeners (**请, 麻烦, 劳驾, 一下, 好吗, 呢, 吧, 啊** as fits), and **您** for respectful address or reference when 你 would sound too blunt. Avoid sounding curt or “ordering people around” when a gentle request is natural in Chinese.
+- **Korean output (target):** Prefer clear **존댓말** (**-습니다/-ㅂ니다, -세요, -어요/-아요** and similar). Avoid **반말, abrupt 명령형, or choppy rough endings** unless the source is unmistakably that kind of speech between peers—then **match the social level** while staying natural Korean.
+- If the source is vulgar or a strong insult, **do not** replace it with polite euphemism that **weakens** what was said; keep strength, but avoid **needlessly** harsher or ruder phrasing in the *other* language (same rule as below).
+
 **Correct output language (non-negotiable):**
 - **Korean source** → output **Chinese only** (口语, Hanzi). **Never** answer in Korean. **Never** “rephrase” Korean into different Korean (same-language rewriting is forbidden).
 - **Chinese source** → output **Korean only** (Hangul). **Never** answer in Chinese. **Never** “rephrase” Chinese into different Chinese.
@@ -428,12 +468,12 @@ Your job is NOT literal word-for-word translation, but you **only interpret what
 - **稍等 / 等一下 / 你稍等我 / 你等我(一下)** = “wait a moment” / “wait for me (a bit).” Natural Korean examples: **잠깐만 기다려 주세요**, **당신은 나를 잠시만 기다려 주세요**, **나 좀만 기다려줘** (match **你** politeness). **Wrong:** any unrelated scenario (blindness, “I can’t see,” etc.).
 - **稍等我问下 … 几个人** (asking how many people **妹妹** is coming with): keep **妹妹** as **여동생** (or **그 여동생**) as context implies; use natural **몇 명이랑 같이 오는지**-style wording. Do **not** over-explain kinship with extra parentheses.
 
-- Korean input → output only in natural spoken Chinese (口语). Match formality to the message (chatty stays chatty; polite/formal stays appropriately polite but still sounds like real speech).
-- Chinese input (Simplified or Traditional) → output only in natural spoken Korean (구어체), same principles.
+- Korean input → output only in natural spoken Chinese (口语), **defaulting to polite 礼貌** as above; adjust down only when the source is clearly very casual/rough.
+- Chinese input (Simplified or Traditional) → output only in natural spoken Korean (**구어체, defaulting to 존댓말** as above); adjust to casual **반말** only when the source clearly is.
 
 Short replies about already knowing / being aware (very common in chat):
-- Korean phrases like **알고 있어**, **알고 있다**, **이미 알아**, **그거 알아** (meaning the speaker *already* knew—often replying in a group that they were not newly informed) → Chinese should use **我知道**, **我都知道**, **这个我知道**, **我早就知道了**, etc. as fits the tone. **Avoid defaulting to 知道了** when it would sound like a fresh acknowledgment ("got it / noted") rather than prior awareness. 知道了 fits "OK I hear you" after new info; **我知道** fits "I'm already aware of that."
-- Chinese **我知道** in dialogue (stating awareness, same page as others) → Korean should express ongoing/shared prior knowledge: **나도 알고 있어**, **(그거) 알고 있어**, **이미 알고 있어**, **나도 알고 있다**. Do not default to bare **나 알아** for 我知道; it often sounds too curt or mismatched compared to "I'm aware too / already knew."
+- Korean phrases like **알고 있어**, **알고 있다**, **이미 알아**, **그거 알아** (meaning the speaker *already* knew—often replying in a group that they were not newly informed) → Chinese should use **我知道**, **我都知道**, **这个我知道**, **我早就知道了**, etc. as fits the **polite** 礼貌 tone. **Avoid defaulting to 知道了** when it would sound like a fresh acknowledgment ("got it / noted") rather than prior awareness. 知道了 fits "OK I hear you" after new info; **我知道** fits "I'm already aware of that."
+- Chinese **我知道** in dialogue (stating awareness, same page as others) → Korean should express ongoing/shared prior knowledge with **polite default**: **저도 알고 있어요**, **(그거) 알고 있어요**, **이미 알고 있어요**, **저도 알고 있어요**; avoid bare **나 알아** unless the source is clearly very casual. Do not default to curt **나 알아** for 我知道 when a courteous form is natural.
 
 Pronouns and "who acts on whom" (do not flip perspective):
 - Chinese **他 / 她 / 他们 / 人家** and Korean **그 / 그녀 / 그들 / 걔 / 쟤** refer to **third parties** unless context clearly says otherwise. **Never** render **他** (him/her) as **나** (me) or **我** as the object of **问** when the source means asking **another person**. Example: **我问他一下** = "I'll ask him / let me ask him" → natural Korean e.g. **그한테 물어볼게**, **걔한테 한번 물어볼게** — **not** **나한테 물어볼게** (that means asking oneself). Same care for **你/您 ↔ 너/당신**, **我 ↔ 나/저**: keep subject/object roles aligned with the source.
@@ -659,6 +699,164 @@ def _telegram_access_allowed(update: Update) -> bool:
     return uid in ALLOWED_USER_IDS or cid in ALLOWED_CHAT_IDS
 
 
+def _is_admin_user(user_id: Optional[int]) -> bool:
+    if user_id is None:
+        return False
+    if not ADMIN_USER_IDS:
+        return False
+    return user_id in ADMIN_USER_IDS
+
+
+async def _safe_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    if not update.effective_chat:
+        return
+    try:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+    except (TimedOut, NetworkError):
+        pass
+    except Exception:
+        pass
+
+
+async def _ensure_totp_authorized(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str
+) -> bool:
+    """인증됐으면 True. 미인증이면 OTP 처리 후 False."""
+    if not TOTP_ACCESS.enabled:
+        return True
+    u = update.effective_user
+    if u is None:
+        return False
+    if TOTP_ACCESS.is_authorized(u.id):
+        return True
+
+    if TOTP_ACCESS.is_locked_out(u.id):
+        await _safe_reply(update, context, TOTP_ACCESS.lockout_message())
+        return False
+
+    code = TOTP_ACCESS.parse_otp_code(user_text)
+    if code:
+        ok, msg = TOTP_ACCESS.try_authenticate(u.id, code)
+        await _safe_reply(update, context, msg)
+        return False
+
+    await _safe_reply(update, context, TOTP_ACCESS.prompt_message())
+    return False
+
+
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if not _telegram_access_allowed(update):
+        await _safe_reply(update, context, _ACCESS_DENIED_TEXT)
+        return
+    if TOTP_ACCESS.enabled:
+        u = update.effective_user
+        if u and TOTP_ACCESS.is_authorized(u.id):
+            await _safe_reply(
+                update,
+                context,
+                "이미 인증되어 있습니다. 번역할 문장을 보내 주시면 됩니다.",
+            )
+            return
+        await _safe_reply(update, context, TOTP_ACCESS.start_message)
+        return
+    await _safe_reply(
+        update,
+        context,
+        "한국어 ↔ 중국어 통역 봇입니다. 번역할 문장을 보내 주시면 됩니다.",
+    )
+
+
+async def handle_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
+    if not TOTP_ACCESS.enabled:
+        await _safe_reply(update, context, "OTP 인증이 비활성화되어 있습니다.")
+        return
+    if TOTP_ACCESS.revoke(update.effective_user.id):
+        await _safe_reply(update, context, "인증이 해제되었습니다. 다시 사용하려면 관리자에게 코드를 요청하세요.")
+    else:
+        await _safe_reply(update, context, "저장된 인증 정보가 없습니다.")
+
+
+async def handle_authlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not _is_admin_user(update.effective_user.id):
+        await _safe_reply(update, context, "관리자만 사용할 수 있는 명령입니다.")
+        return
+    items = TOTP_ACCESS.list_authorized()
+    if not items:
+        await _safe_reply(update, context, "현재 인증된 사용자가 없습니다.")
+        return
+    lines = ["인증된 사용자:"]
+    for uid, rec in items:
+        exp = rec.get("expires_at") or "만료 없음"
+        lines.append(f"- user_id {uid} (만료: {exp})")
+    await _safe_reply(update, context, "\n".join(lines))
+
+
+async def handle_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not _is_admin_user(update.effective_user.id):
+        await _safe_reply(update, context, "관리자만 사용할 수 있는 명령입니다.")
+        return
+    if not context.args:
+        await _safe_reply(update, context, "사용법: /revoke 사용자숫자ID")
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await _safe_reply(update, context, "user id는 숫자여야 합니다.")
+        return
+    if TOTP_ACCESS.revoke(target_id):
+        await _safe_reply(update, context, f"user_id {target_id} 인증을 해제했습니다.")
+    else:
+        await _safe_reply(update, context, "해당 사용자의 인증 기록이 없습니다.")
+
+
+async def handle_revokeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not _is_admin_user(update.effective_user.id):
+        await _safe_reply(update, context, "관리자만 사용할 수 있는 명령입니다.")
+        return
+    count = TOTP_ACCESS.revoke_all()
+    await _safe_reply(update, context, f"인증 {count}명을 모두 해제했습니다.")
+
+
+async def handle_otpcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """관리자 전용: 내 Authenticator 코드가 서버 .env 시크릿과 맞는지 확인."""
+    if not update.effective_user or not _is_admin_user(update.effective_user.id):
+        await _safe_reply(update, context, "관리자만 사용할 수 있는 명령입니다.")
+        return
+    if not TOTP_ACCESS.enabled:
+        await _safe_reply(update, context, "TOTP_SECRET이 설정되지 않았습니다.")
+        return
+    if not context.args:
+        await _safe_reply(
+            update,
+            context,
+            "사용법: /otpcheck 123456\n"
+            "휴대폰 Google Authenticator에 보이는 6자리를 넣으면 "
+            "서버 시크릿과 일치하는지 확인합니다(인증 등록은 하지 않음).",
+        )
+        return
+    code = TOTP_ACCESS.parse_otp_code(context.args[0])
+    if not code:
+        await _safe_reply(update, context, "6자리 숫자만 입력해 주세요.")
+        return
+    if TOTP_ACCESS.verify_code(code):
+        await _safe_reply(
+            update,
+            context,
+            "✅ 일치합니다. 이 코드는 서버에 등록된 당신의 OTP 시크릿으로 생성된 것입니다.",
+        )
+    else:
+        await _safe_reply(
+            update,
+            context,
+            "❌ 불일치합니다. .env의 TOTP_SECRET과 휴대폰 Authenticator 등록 키가 "
+            "같은지 확인하세요.",
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """텍스트 또는 미디어 캡션 수신 시 번역 후 답장."""
     if not update.message:
@@ -704,6 +902,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
             return
+    if not await _ensure_totp_authorized(update, context, user_text):
+        return
     _log_incoming_request(update, user_text)
     reply_context: Optional[str] = None
     if update.message.reply_to_message:
@@ -855,6 +1055,22 @@ def main() -> None:
             "필수 멤버 모드: user_id=%s 가 참여한 그룹·슈퍼그룹에서만 동작(1:1은 본인만)",
             REQUIRE_USER_PRESENT_ID,
         )
+    if TOTP_ACCESS.enabled:
+        logger.info(
+            "관리자 OTP 인증 활성화 — 저장: %s (session_hours=%s)",
+            TOTP_ACCESS.store_path,
+            TOTP_ACCESS.session_hours,
+        )
+        if ADMIN_USER_IDS:
+            logger.info("관리자 user_ids: %s", sorted(ADMIN_USER_IDS))
+        else:
+            logger.warning(
+                "ADMIN_USER_IDS가 비어 있어 /authlist /revoke 명령을 쓸 수 없습니다."
+            )
+    elif _env_bool("ENABLE_TOTP_AUTH", False) and not _totp_secret:
+        logger.warning(
+            "ENABLE_TOTP_AUTH=true 이지만 TOTP_SECRET이 비어 있어 OTP 인증이 꺼져 있습니다."
+        )
     _verify_telegram_token(TELEGRAM_TOKEN)
     # PythonAnywhere ↔ api.telegram.org 구간이 불안정할 때 ReadError·NetworkError 완화
     app = (
@@ -872,6 +1088,12 @@ def main() -> None:
         .build()
     )
     app.add_error_handler(_telegram_error_handler)
+    app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("logout", handle_logout))
+    app.add_handler(CommandHandler("authlist", handle_authlist))
+    app.add_handler(CommandHandler("revoke", handle_revoke))
+    app.add_handler(CommandHandler("revokeall", handle_revokeall))
+    app.add_handler(CommandHandler("otpcheck", handle_otpcheck))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Caption) & ~filters.COMMAND,
